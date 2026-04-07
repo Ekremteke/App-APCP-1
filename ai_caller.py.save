@@ -1,0 +1,230 @@
+"""
+ai_caller.py
+Sends pre-processed pack data to Claude or OpenAI API and retrieves APSS markdown.
+Supports vision inputs for checkbox-heavy pages.
+"""
+
+import os
+import json
+import anthropic
+from typing import Optional
+
+
+# ─────────────────────────────────────────────
+# SYSTEM PROMPT BUILDER
+# ─────────────────────────────────────────────
+
+def load_kb_files(kb_dir: str) -> str:
+    """Load all KB markdown files from a directory into a single system prompt block."""
+    kb_order = [
+        "Security_Runtime_KB.md",
+        "Evidence_Ledger_KB.md",
+        "APCP-20-30_Stabilisation_Rules_KB.md",
+        "Disclaimer_Routing_Map_KB.md",
+        "Word_Template_Handling_APSS.md",
+        "APSS_Disclaimer_Library.md",
+        "AI_Training_KB.md",
+        "Security_Policy_Knowledge.md",
+    ]
+    blocks = []
+    for fname in kb_order:
+        fpath = os.path.join(kb_dir, fname)
+        if os.path.exists(fpath):
+            with open(fpath, "r", encoding="utf-8") as f:
+                content = f.read()
+            blocks.append(f"# === {fname} ===\n\n{content}")
+    return "\n\n".join(blocks)
+
+
+SYSTEM_PROMPT_BASE = """
+ROLE
+You are Medway Law's Legal Pack Assistant.
+
+MISSION
+Produce one completed Auction Pack Summary Sheet (APSS) for one single target property sold via iamsold.
+Use only the pre-processed pack evidence provided below.
+The evidence has already been extracted and structured by a pre-processor.
+Key page images are provided separately for checkbox-dependent fields.
+
+OUTPUT
+Output only the completed APSS in Markdown using the canonical APSS_Simple_Template structure.
+Output nothing before or after the APSS.
+No narrative, reasoning, commentary, or process summary.
+
+IMPORTANT: The pre-processor has already done document inventory and text extraction.
+You do not need to re-read files. Work from the structured evidence provided.
+Key page images are provided for visual checkbox verification — use them.
+
+EVIDENCE FORMAT
+The pre-processed evidence is provided in two forms:
+1. TEXT BLOCK: Full extracted text from all documents, organised by document type and page.
+2. KEY PAGE IMAGES: Rendered images of checkbox-heavy pages (TA6, TA7, Additional Enquiries, EPC).
+   Use the images to verify checkbox states. Images are more reliable than text extraction for checkboxes.
+
+CHECKBOX READING RULE
+When reading checkboxes from images:
+- An X or tick mark in a box = that option is selected
+- An empty box = not selected
+- Unclear = Requires manual verification
+Do not guess checkbox states. Use the rendered images.
+
+COUNCIL TAX HARD STOP RULE
+If Council Tax Band is not in the evidence, you must call the approved lookup.
+If the lookup fails, output a holding message and do not publish the APSS.
+
+RE-CHECK RULE
+Complete re-check of all high-impact fields before outputting the APSS.
+Do not output and then re-check. Re-check first, then output.
+
+DEFECT LOCK REMINDERS (from AI_Training_KB):
+- DL-01: EPC rating MUST be in Property Overview if EPC is provided
+- DL-02: EPC rating must be first line of EPC comments before disclaimers
+- DL-04: Planning & Certificates — only ❌ if seller disclosed works AND docs missing
+- DL-05: Check LH Register C section for rentcharge → trigger #46
+- DL-06: Check TA7 5.8 AND Management Pack for cladding → trigger #39
+- DL-07: Check who completed LPE1 — managing agent = trigger #22
+- DL-08: Environmental search missing → plain-text note in searchComments
+- DL-08A: TA6 incomplete → trigger #50
+- DL-09: Knotweed — verify actual checkbox, No = no disclaimer
+- DL-13: Management pack disclaimer — ordered-not-received (#17) vs declined (#19)
+- DL-17: FH title register is NOT a sale title — do not trigger #02
+- DL-18: No raw filenames in evidence anchors — use normalised labels only
+- DL-21: Ground rent — if not payable, do not include a figure
+
+{kb_content}
+"""
+
+
+# ─────────────────────────────────────────────
+# CLAUDE API CALLER
+# ─────────────────────────────────────────────
+
+def call_claude(
+    text_evidence: str,
+    vision_inputs: list,
+    api_key: str,
+    kb_dir: Optional[str] = None,
+    model: str = "claude-sonnet-4-20250514",
+) -> str:
+    """
+    Call Claude API with pre-processed pack evidence.
+    Returns APSS markdown string.
+    """
+    client = anthropic.Anthropic(api_key=api_key)
+
+    # Build system prompt
+    kb_content = load_kb_files(kb_dir) if kb_dir else ""
+    system_prompt = SYSTEM_PROMPT_BASE.format(kb_content=kb_content)
+
+    # Build user message with text evidence
+    user_content = []
+
+    # Add text evidence
+    user_content.append({
+        "type": "text",
+        "text": (
+            "Below is the pre-processed auction pack evidence. "
+            "Please produce the completed APSS.\n\n"
+            f"{text_evidence}"
+        )
+    })
+
+    # Add key page images for visual checkbox verification
+    if vision_inputs:
+        user_content.append({
+            "type": "text",
+            "text": (
+                "\n\nKEY PAGE IMAGES FOR CHECKBOX VERIFICATION:\n"
+                "The following images are rendered pages from checkbox-heavy documents. "
+                "Use these to verify checkbox states accurately."
+            )
+        })
+        for vi in vision_inputs:
+            label = (
+                f"Document: {vi['doc_type'].upper()} ({vi['filename']}) "
+                f"— Page {vi['page_num']}"
+            )
+            user_content.append({
+                "type": "text",
+                "text": label,
+            })
+            user_content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": vi["image_b64"],
+                }
+            })
+
+    # Call API
+    response = client.messages.create(
+        model=model,
+        max_tokens=8000,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_content}],
+    )
+
+    return response.content[0].text
+
+
+# ─────────────────────────────────────────────
+# OPENAI API CALLER (fallback)
+# ─────────────────────────────────────────────
+
+def call_openai(
+    text_evidence: str,
+    vision_inputs: list,
+    api_key: str,
+    kb_dir: Optional[str] = None,
+    model: str = "gpt-4o",
+) -> str:
+    """
+    Call OpenAI API with pre-processed pack evidence.
+    Returns APSS markdown string.
+    """
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+
+    kb_content = load_kb_files(kb_dir) if kb_dir else ""
+    system_prompt = SYSTEM_PROMPT_BASE.format(kb_content=kb_content)
+
+    user_content = []
+    user_content.append({
+        "type": "text",
+        "text": (
+            "Below is the pre-processed auction pack evidence. "
+            "Please produce the completed APSS.\n\n"
+            f"{text_evidence}"
+        )
+    })
+
+    for vi in vision_inputs:
+        label = (
+            f"Document: {vi['doc_type'].upper()} ({vi['filename']}) "
+            f"— Page {vi['page_num']}"
+        )
+        user_content.append({"type": "text", "text": label})
+        user_content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/png;base64,{vi['image_b64']}",
+                "detail": "high",
+            }
+        })
+
+    response = client.chat.completions.create(
+        model=model,
+        max_tokens=8000,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+    )
+
+    return response.choices[0].message.content
+
+
+model: str = "gpt-4o",
+
+

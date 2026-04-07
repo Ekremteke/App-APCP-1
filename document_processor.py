@@ -212,7 +212,7 @@ def process_zip(zip_path: str) -> dict:
         pdf_files = []
         for root, dirs, files in os.walk(tmpdir):
             for fname in files:
-                if fname.lower().endswith(".pdf"):
+                if fname.lower().endswith(".pdf") and not fname.startswith("._"):
                     fpath = os.path.join(root, fname)
                     doc_type = identify_document(fname)
                     entry = {

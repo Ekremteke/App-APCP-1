@@ -33,8 +33,10 @@ def load_kb_files(kb_dir: str) -> str:
             with open(fpath, "r", encoding="utf-8") as f:
                 content = f.read()
             blocks.append(f"# === {fname} ===\n\n{content}")
-    return "\n\n".join(blocks)
-
+    combined = "\n\n".join(blocks)
+    if len(combined) > 40000:
+        combined = combined[:40000] + "\n\n[KB truncated for token limit]"
+    return combined
 
 SYSTEM_PROMPT_BASE = """
 ROLE

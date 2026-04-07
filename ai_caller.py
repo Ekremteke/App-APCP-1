@@ -177,7 +177,7 @@ def call_openai(
     vision_inputs: list,
     api_key: str,
     kb_dir: Optional[str] = None,
-    model: str = "gpt-4o",
+    model: str = "gpt-4o-mini",
 ) -> str:
     """
     Call OpenAI API with pre-processed pack evidence.

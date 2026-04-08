@@ -129,7 +129,7 @@ def call_openai(
     user_content = []
     user_content.append({
         "type": "text",
-        "text": f"Analyse this auction pack evidence and return the JSON:\n\n{text_evidence}"
+        "text": f"Analyse this auction pack evidence and return the JSON:\n\n{text_evidence[:15000]}"
     })
 
     for vi in vision_inputs[:6]:
@@ -182,7 +182,7 @@ def call_claude(
     user_content = []
     user_content.append({
         "type": "text",
-        "text": f"Analyse this auction pack evidence and return the JSON:\n\n{text_evidence}"
+        "text": f"Analyse this auction pack evidence and return the JSON:\n\n{text_evidence[:15000]}"
     })
 
     for vi in vision_inputs[:6]:

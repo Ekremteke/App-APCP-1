@@ -1,24 +1,17 @@
 """
-app.py
-Streamlit web application for APSS generation.
-Users upload a ZIP file, the system processes it and returns a DOCX.
-No technical knowledge required from users.
+app.py - APSS Generator Streamlit App
+Users upload ZIP → system generates APSS DOCX automatically.
 """
 
 import streamlit as st
 import tempfile
 import os
 import time
-from pathlib import Path
 
 from document_processor import process_zip, build_text_summary, collect_vision_inputs
-from ai_caller import call_claude, call_openai
-from docx_generator import fill_template, check_remaining_placeholders
+from ai_caller import call_openai, call_claude
+from docx_generator import fill_template, check_remaining_placeholders, json_to_markdown_preview
 
-
-# ─────────────────────────────────────────────
-# PAGE CONFIG
-# ─────────────────────────────────────────────
 
 st.set_page_config(
     page_title="APSS Generator — Medway Law",
@@ -26,23 +19,17 @@ st.set_page_config(
     layout="centered",
 )
 
-# ─────────────────────────────────────────────
-# CONFIGURATION (from Streamlit secrets or env)
-# ─────────────────────────────────────────────
 
 def get_config():
-    """Load API keys and paths from Streamlit secrets or environment variables."""
     config = {}
     try:
-        # Streamlit Cloud secrets
-        config["api_provider"] = st.secrets.get("API_PROVIDER", "claude")
+        config["api_provider"] = st.secrets.get("API_PROVIDER", "openai")
         config["claude_api_key"] = st.secrets.get("CLAUDE_API_KEY", "")
         config["openai_api_key"] = st.secrets.get("OPENAI_API_KEY", "")
         config["template_path"] = st.secrets.get("TEMPLATE_PATH", "APSS_Simple_Template.docx")
         config["kb_dir"] = st.secrets.get("KB_DIR", "kb")
     except Exception:
-        # Local development: use environment variables
-        config["api_provider"] = os.getenv("API_PROVIDER", "claude")
+        config["api_provider"] = os.getenv("API_PROVIDER", "openai")
         config["claude_api_key"] = os.getenv("CLAUDE_API_KEY", "")
         config["openai_api_key"] = os.getenv("OPENAI_API_KEY", "")
         config["template_path"] = os.getenv("TEMPLATE_PATH", "APSS_Simple_Template.docx")
@@ -50,18 +37,11 @@ def get_config():
     return config
 
 
-# ─────────────────────────────────────────────
-# MAIN PIPELINE
-# ─────────────────────────────────────────────
-
 def run_pipeline(zip_path: str, config: dict, progress_callback=None) -> dict:
-    """
-    Full APSS generation pipeline.
-    Returns dict with: apss_markdown, docx_path, warnings, errors
-    """
     result = {
-        "apss_markdown": "",
+        "field_values": {},
         "docx_path": "",
+        "markdown_preview": "",
         "warnings": [],
         "errors": [],
         "processing_notes": [],
@@ -69,8 +49,7 @@ def run_pipeline(zip_path: str, config: dict, progress_callback=None) -> dict:
 
     # Step 1: Pre-process ZIP
     if progress_callback:
-        progress_callback(0.1, "📂 Extracting and reading auction pack documents...")
-
+        progress_callback(0.1, "📂 Reading auction pack documents...")
     try:
         processed = process_zip(zip_path)
         result["processing_notes"] = processed.get("processing_notes", [])
@@ -78,122 +57,101 @@ def run_pipeline(zip_path: str, config: dict, progress_callback=None) -> dict:
         result["errors"].append(f"Document processing failed: {e}")
         return result
 
-    # Step 2: Build text evidence
+    # Step 2: Build evidence
     if progress_callback:
-        progress_callback(0.35, "📝 Structuring evidence for AI analysis...")
-
+        progress_callback(0.3, "📝 Structuring evidence...")
     text_evidence = build_text_summary(processed)
     vision_inputs = collect_vision_inputs(processed)
 
-    if vision_inputs:
-        result["processing_notes"].append(
-            f"Sending {len(vision_inputs)} rendered page image(s) for visual checkbox verification."
-        )
-
-    # Step 3: Call AI API
+    # Step 3: Call AI → get JSON
     if progress_callback:
-        progress_callback(0.50, "🤖 Generating APSS — this may take 2-3 minutes...")
-
+        progress_callback(0.5, "🤖 Analysing pack — please wait (1-2 minutes)...")
     try:
-        provider = config.get("api_provider", "claude")
+        provider = config.get("api_provider", "openai")
         if provider == "claude":
-            apss_markdown = call_claude(
+            field_values = call_claude(
                 text_evidence=text_evidence,
                 vision_inputs=vision_inputs,
                 api_key=config["claude_api_key"],
                 kb_dir=config["kb_dir"],
             )
         else:
-            apss_markdown = call_openai(
+            field_values = call_openai(
                 text_evidence=text_evidence,
                 vision_inputs=vision_inputs,
                 api_key=config["openai_api_key"],
                 kb_dir=config["kb_dir"],
             )
-        result["apss_markdown"] = apss_markdown
+
+        if not field_values:
+            result["errors"].append("AI returned empty response. Please try again.")
+            return result
+
+        result["field_values"] = field_values
+        result["markdown_preview"] = json_to_markdown_preview(field_values)
+
     except Exception as e:
         result["errors"].append(f"AI API call failed: {e}")
         return result
 
-    # Check for holding message (Council Tax hard stop)
-    if "Publication of the APSS is paused" in apss_markdown:
-        result["warnings"].append(
-            "Council Tax Band could not be confirmed automatically. "
-            "Please add it manually to the APSS."
-        )
-
-    # Step 4: Generate DOCX
+    # Step 4: Fill DOCX template
     if progress_callback:
-        progress_callback(0.85, "📄 Generating Word document from template...")
+        progress_callback(0.85, "📄 Generating Word document...")
 
     template_path = config.get("template_path", "APSS_Simple_Template.docx")
     if not os.path.exists(template_path):
         result["warnings"].append(
-            "APSS_Simple_Template.docx not found. DOCX generation skipped. "
-            "Markdown APSS is available below."
+            "Template file not found. DOCX skipped — review the APSS preview below."
         )
     else:
         try:
             with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
                 docx_path = tmp.name
-            fill_template(template_path, apss_markdown, docx_path)
-
-            # Check for remaining placeholders
+            fill_template(template_path, field_values, docx_path)
             remaining = check_remaining_placeholders(docx_path)
             if remaining:
                 result["warnings"].append(
-                    f"{len(remaining)} placeholder(s) could not be auto-filled. "
-                    "Please review the DOCX manually."
+                    f"{len(remaining)} field(s) could not be auto-filled: "
+                    f"{', '.join(remaining[:5])}. Please check the DOCX."
                 )
             result["docx_path"] = docx_path
         except Exception as e:
             result["warnings"].append(f"DOCX generation failed: {e}")
 
     if progress_callback:
-        progress_callback(1.0, "✅ Complete!")
+        progress_callback(1.0, "✅ Done!")
 
     return result
 
 
-# ─────────────────────────────────────────────
-# STREAMLIT UI
-# ─────────────────────────────────────────────
-
 def main():
     config = get_config()
 
-    # Header
     st.title("⚖️ Auction Pack Summary Sheet Generator")
     st.markdown(
-        "Upload a Buyer Information Pack ZIP file to automatically generate "
-        "an Auction Pack Summary Sheet (APSS)."
+        "Upload a Buyer Information Pack ZIP file to automatically generate an APSS."
     )
     st.divider()
 
-    # File upload
     uploaded_file = st.file_uploader(
         "Upload Auction Pack ZIP",
         type=["zip"],
-        help="Upload the complete Buyer Information Pack ZIP file received from iamsold.",
+        help="Upload the complete Buyer Information Pack ZIP file.",
     )
 
     if not uploaded_file:
         st.info("👆 Upload a ZIP file to get started.")
         return
 
-    # Show file info
-    file_size_mb = uploaded_file.size / (1024 * 1024)
-    st.success(f"📦 **{uploaded_file.name}** ({file_size_mb:.1f} MB) — ready to process.")
+    size_mb = uploaded_file.size / (1024 * 1024)
+    st.success(f"📦 **{uploaded_file.name}** ({size_mb:.1f} MB) — ready.")
 
-    # Generate button
     if st.button("🚀 Generate APSS", type="primary", use_container_width=True):
 
-        # Save uploaded file to temp location
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_zip:
             tmp_zip.write(uploaded_file.read())
             zip_path = tmp_zip.name
 
-        # Progress tracking
         progress_bar = st.progress(0)
         status_text = st.empty()
 
@@ -201,17 +159,16 @@ def main():
             progress_bar.progress(pct)
             status_text.text(message)
 
-        start_time = time.time()
+        start = time.time()
 
         with st.spinner("Processing..."):
             result = run_pipeline(zip_path, config, progress_callback)
 
-        elapsed = round(time.time() - start_time)
+        elapsed = round(time.time() - start)
         os.unlink(zip_path)
 
         st.divider()
 
-        # Results
         if result["errors"]:
             st.error("❌ Processing failed:")
             for e in result["errors"]:
@@ -220,9 +177,8 @@ def main():
 
         st.success(f"✅ APSS generated in {elapsed} seconds.")
 
-        # Warnings
         if result["warnings"]:
-            st.warning("⚠️ Please review the following:")
+            st.warning("⚠️ Please review:")
             for w in result["warnings"]:
                 st.write(f"- {w}")
 
@@ -241,11 +197,12 @@ def main():
                 use_container_width=True,
             )
 
-        # Show markdown APSS in expander
-        with st.expander("📋 View APSS markdown (for reference)", expanded=False):
-            st.markdown(result["apss_markdown"])
+        # Preview
+        if result["markdown_preview"]:
+            with st.expander("📋 APSS Preview", expanded=True):
+                st.markdown(result["markdown_preview"])
 
-        # Processing notes (for debugging)
+        # Processing notes
         if result["processing_notes"]:
             with st.expander("🔍 Processing notes", expanded=False):
                 for note in result["processing_notes"]:

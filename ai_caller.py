@@ -1,178 +1,116 @@
 """
 ai_caller.py
-Sends pre-processed pack data to Claude or OpenAI API and retrieves APSS markdown.
-Supports vision inputs for checkbox-heavy pages.
+Sends pre-processed pack data to OpenAI/Claude API.
+Returns structured JSON matching template placeholders exactly.
 """
 
 import os
 import json
-import anthropic
+import re
 from typing import Optional
 
 
-# ─────────────────────────────────────────────
-# SYSTEM PROMPT BUILDER
-# ─────────────────────────────────────────────
-
 def load_kb_files(kb_dir: str) -> str:
-    """Load all KB markdown files from a directory into a single system prompt block."""
+    """Load critical KB files - keeps token count manageable."""
     kb_order = [
         "Security_Runtime_KB.md",
-        "Evidence_Ledger_KB.md",
         "APCP-20-30_Stabilisation_Rules_KB.md",
         "Disclaimer_Routing_Map_KB.md",
-        "Word_Template_Handling_APSS.md",
-        "APSS_Disclaimer_Library.md",
         "AI_Training_KB.md",
-        "Security_Policy_Knowledge.md",
+        "APSS_Disclaimer_Library.md",
     ]
     blocks = []
+    total = 0
+    limit = 20000
+
     for fname in kb_order:
         fpath = os.path.join(kb_dir, fname)
         if os.path.exists(fpath):
             with open(fpath, "r", encoding="utf-8") as f:
                 content = f.read()
-            blocks.append(f"# === {fname} ===\n\n{content}")
-    combined = "\n\n".join(blocks)
-    if len(combined) > 40000:
-        combined = combined[:40000] + "\n\n[KB truncated for token limit]"
-    return combined
+            if len(content) > 6000:
+                content = content[:6000] + "\n[truncated]"
+            block = f"# {fname}\n\n{content}"
+            if total + len(block) > limit:
+                break
+            blocks.append(block)
+            total += len(block)
 
-SYSTEM_PROMPT_BASE = """
-ROLE
-You are Medway Law's Legal Pack Assistant.
+    return "\n\n".join(blocks)
 
-MISSION
-Produce one completed Auction Pack Summary Sheet (APSS) for one single target property sold via iamsold.
-Use only the pre-processed pack evidence provided below.
-The evidence has already been extracted and structured by a pre-processor.
-Key page images are provided separately for checkbox-dependent fields.
 
-OUTPUT
-Output only the completed APSS in Markdown using the canonical APSS_Simple_Template structure.
-Output nothing before or after the APSS.
-No narrative, reasoning, commentary, or process summary.
+JSON_SYSTEM_PROMPT = """You are Medway Law's Legal Pack Assistant.
 
-IMPORTANT: The pre-processor has already done document inventory and text extraction.
-You do not need to re-read files. Work from the structured evidence provided.
-Key page images are provided for visual checkbox verification — use them.
+Analyse the auction pack evidence provided and return ONLY a valid JSON object.
+No markdown. No explanation. No preamble. Just the JSON.
 
-EVIDENCE FORMAT
-The pre-processed evidence is provided in two forms:
-1. TEXT BLOCK: Full extracted text from all documents, organised by document type and page.
-2. KEY PAGE IMAGES: Rendered images of checkbox-heavy pages (TA6, TA7, Additional Enquiries, EPC).
-   Use the images to verify checkbox states. Images are more reliable than text extraction for checkboxes.
+The JSON must contain ALL of these keys:
 
-CHECKBOX READING RULE
-When reading checkboxes from images:
-- An X or tick mark in a box = that option is selected
-- An empty box = not selected
-- Unclear = Requires manual verification
-Do not guess checkbox states. Use the rendered images.
+PROPERTY OVERVIEW KEYS:
+- propertyAddress
+- tenure (include evidence anchor)
+- propertyType (include evidence anchor)
+- leaseTerm (include evidence anchor, or "Not applicable")
+- councilTaxBand (include evidence anchor, or "Council Tax Band lookup required")
+- listedBuildingOrConservationArea (include evidence anchor)
+- parkingArrangements (include evidence anchor)
+- constructionType (include evidence anchor)
+- serviceRentGrounds (full ground rent and service charge details with evidence)
+- sharedOwnershipPercent (percentage or "✅ Not applicable. Evidence: TA7 p.4 / 1.1")
+- materialPropertyNotes (material information notes about the property itself)
 
-COUNCIL TAX HARD STOP RULE
-If Council Tax Band is not in the evidence, you must call the approved lookup.
-If the lookup fails, output a holding message and do not publish the APSS.
+KEY DOCUMENT STATUS KEYS (each needs status + comments):
+- titleStatus, titleComments
+- ta6Status, ta6Comments
+- ta10Status, ta10Comments
+- addInfoStatus, addInfoComments
+- epcStatus, epcComments
+- searchStatus, searchComments
+- leaseInfoStatus, leaseInfoComments
+- planningStatus, planningComments
+- tenancyStatus, tenancyComments
+- probateStatus, probateComments
+- hmoStatus, hmoComments
+- miNotesStatus, materialPropertyNotesComments
 
-RE-CHECK RULE
-Complete re-check of all high-impact fields before outputting the APSS.
-Do not output and then re-check. Re-check first, then output.
+STATUS VALUES - use exactly one of:
+- "✅ Provided"
+- "✅ Not applicable"
+- "❌ Information not available in pack – requires manual review"
+- "⚠️ Requires manual verification"
 
-DEFECT LOCK REMINDERS (from AI_Training_KB):
-- DL-01: EPC rating MUST be in Property Overview if EPC is provided
-- DL-02: EPC rating must be first line of EPC comments before disclaimers
-- DL-04: Planning & Certificates — only ❌ if seller disclosed works AND docs missing
-- DL-05: Check LH Register C section for rentcharge → trigger #46
-- DL-06: Check TA7 5.8 AND Management Pack for cladding → trigger #39
-- DL-07: Check who completed LPE1 — managing agent = trigger #22
-- DL-08: Environmental search missing → plain-text note in searchComments
-- DL-08A: TA6 incomplete → trigger #50
-- DL-09: Knotweed — verify actual checkbox, No = no disclaimer
-- DL-13: Management pack disclaimer — ordered-not-received (#17) vs declined (#19)
-- DL-17: FH title register is NOT a sale title — do not trigger #02
-- DL-18: No raw filenames in evidence anchors — use normalised labels only
-- DL-21: Ground rent — if not payable, do not include a figure
+MATERIAL FLAGS KEYS (value must be exactly "Yes" or "No"):
+- flagTitleDiscrepancies
+- flagRightsOfWay
+- flagRestrictiveCovenants
+- flagPlanningIssues
+- flagEpcBelowE
+- flagUnregisteredTitle
+- flagHmoLicensing
+- flagLeaseholdInfo
+- flagEnvironmentalRisks
+- flagOccupiersTenancy
+- flagSoldAsSeen
+
+CRITICAL RULES:
+1. EPC rating E, F or G → flagEpcBelowE = "Yes". epcComments must start with "EPC rating: [letter]. Evidence: EPC p.1 / Energy rating."
+2. Seller disclosed NO works requiring planning → planningStatus = "✅ Not applicable"
+3. FH title register alone does NOT mean multiple boundaries for sale
+4. Ground rent confirmed NOT payable → do not state a ground rent figure
+5. Shared ownership: if standard leasehold flat → sharedOwnershipPercent = "✅ Not applicable. Evidence: TA7 p.4 / 1.1"
+6. Environmental search missing → note in searchComments: "An environmental search is not included in this pack. Prospective buyers are strongly advised to obtain this independently before bidding."
+7. LH Register C section mentions rentcharge → add to materialPropertyNotes
+8. Cladding in Management Pack or TA7 5.8 → add cladding note to materialPropertyNotes
+9. LPE1 by managing agent not RTM → add to leaseInfoComments: "The LPE1 has not been completed by a Right to Manage Company (RTM)..."
+10. TA6 has multiple Not Known or incomplete → add to ta6Comments
+
+EVIDENCE ANCHOR FORMAT: "Evidence: [Label] p.[N] / [Section]"
+ALLOWED LABELS: "Leasehold Title Register", "Freehold Title Register", "TA6", "TA7", "TA10", "Management Pack", "EPC", "Local Authority Search", "Water and Drainage Search", "Additional Enquiries Form", "Buyer Pack Summary Note", "Lease", "Correspondence"
+DO NOT use raw filenames like "TA6 11.6.2020.pdf"
 
 {kb_content}
 """
 
-
-# ─────────────────────────────────────────────
-# CLAUDE API CALLER
-# ─────────────────────────────────────────────
-
-def call_claude(
-    text_evidence: str,
-    vision_inputs: list,
-    api_key: str,
-    kb_dir: Optional[str] = None,
-    model: str = "claude-sonnet-4-20250514",
-) -> str:
-    """
-    Call Claude API with pre-processed pack evidence.
-    Returns APSS markdown string.
-    """
-    client = anthropic.Anthropic(api_key=api_key)
-
-    # Build system prompt
-    kb_content = load_kb_files(kb_dir) if kb_dir else ""
-    system_prompt = SYSTEM_PROMPT_BASE.format(kb_content=kb_content)
-
-    # Build user message with text evidence
-    user_content = []
-
-    # Add text evidence
-    user_content.append({
-        "type": "text",
-        "text": (
-            "Below is the pre-processed auction pack evidence. "
-            "Please produce the completed APSS.\n\n"
-            f"{text_evidence}"
-        )
-    })
-
-    # Add key page images for visual checkbox verification
-    if vision_inputs:
-        user_content.append({
-            "type": "text",
-            "text": (
-                "\n\nKEY PAGE IMAGES FOR CHECKBOX VERIFICATION:\n"
-                "The following images are rendered pages from checkbox-heavy documents. "
-                "Use these to verify checkbox states accurately."
-            )
-        })
-        for vi in vision_inputs:
-            label = (
-                f"Document: {vi['doc_type'].upper()} ({vi['filename']}) "
-                f"— Page {vi['page_num']}"
-            )
-            user_content.append({
-                "type": "text",
-                "text": label,
-            })
-            user_content.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": vi["image_b64"],
-                }
-            })
-
-    # Call API
-    response = client.messages.create(
-        model=model,
-        max_tokens=8000,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_content}],
-    )
-
-    return response.content[0].text
-
-
-# ─────────────────────────────────────────────
-# OPENAI API CALLER (fallback)
-# ─────────────────────────────────────────────
 
 def call_openai(
     text_evidence: str,
@@ -180,48 +118,99 @@ def call_openai(
     api_key: str,
     kb_dir: Optional[str] = None,
     model: str = "gpt-4o-mini",
-) -> str:
-    """
-    Call OpenAI API with pre-processed pack evidence.
-    Returns APSS markdown string.
-    """
+) -> dict:
+    """Call OpenAI API. Returns JSON dict of APSS field values."""
     from openai import OpenAI
     client = OpenAI(api_key=api_key)
 
     kb_content = load_kb_files(kb_dir) if kb_dir else ""
-    system_prompt = SYSTEM_PROMPT_BASE.format(kb_content=kb_content)
+    system_prompt = JSON_SYSTEM_PROMPT.format(kb_content=kb_content)
 
     user_content = []
     user_content.append({
         "type": "text",
-        "text": (
-            "Below is the pre-processed auction pack evidence. "
-            "Please produce the completed APSS.\n\n"
-            f"{text_evidence}"
-        )
+        "text": f"Analyse this auction pack evidence and return the JSON:\n\n{text_evidence}"
     })
 
-    for vi in vision_inputs:
-        label = (
-            f"Document: {vi['doc_type'].upper()} ({vi['filename']}) "
-            f"— Page {vi['page_num']}"
-        )
-        user_content.append({"type": "text", "text": label})
+    for vi in vision_inputs[:6]:
+        user_content.append({
+            "type": "text",
+            "text": f"[{vi['doc_type'].upper()} page {vi['page_num']}]"
+        })
         user_content.append({
             "type": "image_url",
             "image_url": {
                 "url": f"data:image/png;base64,{vi['image_b64']}",
-                "detail": "high",
+                "detail": "low",
             }
         })
 
     response = client.chat.completions.create(
         model=model,
-        max_tokens=8000,
+        max_tokens=4000,
+        response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
     )
 
-    return response.choices[0].message.content
+    raw = response.choices[0].message.content
+    try:
+        return json.loads(raw)
+    except Exception:
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        return {}
+
+
+def call_claude(
+    text_evidence: str,
+    vision_inputs: list,
+    api_key: str,
+    kb_dir: Optional[str] = None,
+    model: str = "claude-sonnet-4-20250514",
+) -> dict:
+    """Call Claude API. Returns JSON dict of APSS field values."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key)
+
+    kb_content = load_kb_files(kb_dir) if kb_dir else ""
+    system_prompt = JSON_SYSTEM_PROMPT.format(kb_content=kb_content)
+
+    user_content = []
+    user_content.append({
+        "type": "text",
+        "text": f"Analyse this auction pack evidence and return the JSON:\n\n{text_evidence}"
+    })
+
+    for vi in vision_inputs[:6]:
+        user_content.append({
+            "type": "text",
+            "text": f"[{vi['doc_type'].upper()} page {vi['page_num']}]"
+        })
+        user_content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": vi["image_b64"],
+            }
+        })
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=4000,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_content}],
+    )
+
+    raw = response.content[0].text
+    try:
+        return json.loads(raw)
+    except Exception:
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        return {}
